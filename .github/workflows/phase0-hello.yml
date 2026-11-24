@@ -1,0 +1,65 @@
+name: phase0-hello
+
+on:
+  push:
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+  workflow_dispatch:
+
+jobs:
+  hello:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Hello and runner identity
+        run: |
+          echo "Hello from Xender-X CI"
+          date -u
+          uname -a
+          cat /etc/os-release
+          echo "ImageOS=${ImageOS:-unknown} ImageVersion=${ImageVersion:-unknown}"
+          id
+
+      - name: CPU and RAM
+        run: |
+          echo "nproc: $(nproc)"
+          lscpu | head -n 25
+          free -h
+
+      - name: Disk space
+        run: |
+          df -h
+          echo "--- free space on / and /mnt ---"
+          df -h / /mnt || true
+
+      - name: QEMU availability
+        run: |
+          which qemu-system-x86_64 || echo "qemu-system-x86_64 NOT installed (will install in CI when needed)"
+          qemu-system-x86_64 --version || true
+
+      - name: KVM check (before any change)
+        run: |
+          ls -l /dev/kvm || echo "/dev/kvm NOT present"
+          if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+            echo "RESULT: KVM usable before change"
+          else
+            echo "RESULT: KVM NOT usable before change"
+          fi
+          grep -E -c '(vmx|svm)' /proc/cpuinfo || true
+
+      - name: KVM udev rule attempt
+        continue-on-error: true
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: KVM check (after udev rule)
+        run: |
+          ls -l /dev/kvm || echo "/dev/kvm NOT present"
+          if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+            echo "RESULT: KVM usable after change"
+          else
+            echo "RESULT: KVM NOT usable after change"
+          fi
