@@ -1,0 +1,50 @@
+name: phase1-fetch-buildroot
+
+on:
+  push:
+    paths:
+      - '.github/workflows/phase1-fetch-buildroot.yml'
+  workflow_dispatch:
+
+env:
+  BR_VERSION: "2025.02.14"
+  BR_URL: "https://buildroot.org/downloads"
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Download tarball and signature
+        run: |
+          set -eux
+          mkdir -p "$RUNNER_TEMP/br"
+          cd "$RUNNER_TEMP/br"
+          curl -fsSL -o "buildroot-${BR_VERSION}.tar.gz" "${BR_URL}/buildroot-${BR_VERSION}.tar.gz"
+          curl -fsSL -o "buildroot-${BR_VERSION}.tar.gz.sign" "${BR_URL}/buildroot-${BR_VERSION}.tar.gz.sign"
+          ls -l
+
+      - name: Facts (size, sha256, signature file type)
+        run: |
+          cd "$RUNNER_TEMP/br"
+          sha256sum "buildroot-${BR_VERSION}.tar.gz"
+          file "buildroot-${BR_VERSION}.tar.gz.sign"
+          wc -c "buildroot-${BR_VERSION}.tar.gz.sign"
+          echo "--- first 300 bytes of .sign (non-printable chars escaped) ---"
+          head -c 300 "buildroot-${BR_VERSION}.tar.gz.sign" | cat -v
+          echo
+          echo "--- tar listing sanity check ---"
+          tar -tzf "buildroot-${BR_VERSION}.tar.gz" | head -n 5
+
+      - name: Signature check (EXPECTED to say no public key)
+        continue-on-error: true
+        run: |
+          cd "$RUNNER_TEMP/br"
+          gpg --version | head -n 1
+          gpg --batch --no-tty --verify "buildroot-${BR_VERSION}.tar.gz.sign" "buildroot-${BR_VERSION}.tar.gz" 2>&1
+
+      - name: Signature packets (who signed it, key ID)
+        continue-on-error: true
+        run: |
+          cd "$RUNNER_TEMP/br"
+          gpg --batch --no-tty --list-packets "buildroot-${BR_VERSION}.tar.gz.sign" 2>&1 | head -n 40
