@@ -24,27 +24,63 @@ jobs:
           curl -fsSL -o "buildroot-${BR_VERSION}.tar.gz.sign" "${BR_URL}/buildroot-${BR_VERSION}.tar.gz.sign"
           ls -l
 
-      - name: Facts (size, sha256, signature file type)
+      - name: Facts (size, sha256, file type, tar sanity)
         run: |
+          set -eu
           cd "$RUNNER_TEMP/br"
           sha256sum "buildroot-${BR_VERSION}.tar.gz"
           file "buildroot-${BR_VERSION}.tar.gz.sign"
           wc -c "buildroot-${BR_VERSION}.tar.gz.sign"
-          echo "--- first 300 bytes of .sign (non-printable chars escaped) ---"
-          head -c 300 "buildroot-${BR_VERSION}.tar.gz.sign" | cat -v
-          echo
-          echo "--- tar listing sanity check ---"
-          tar -tzf "buildroot-${BR_VERSION}.tar.gz" | head -n 5
+          tar -tzf "buildroot-${BR_VERSION}.tar.gz" > tar_list.txt
+          echo "tar entries: $(wc -l < tar_list.txt)"
+          echo "--- first 5 entries ---"
+          sed -n '1,5p' tar_list.txt
 
-      - name: Signature check (EXPECTED to say no public key)
+      - name: Compare SHA256 in signed text with tarball (internal consistency only)
+        run: |
+          set -eu
+          cd "$RUNNER_TEMP/br"
+          SIGN="buildroot-${BR_VERSION}.tar.gz.sign"
+          TARBALL="buildroot-${BR_VERSION}.tar.gz"
+
+          # Signed text = lines between the clearsign header and the signature block
+          awk '/^-----BEGIN PGP SIGNED MESSAGE-----/{f=1;next} /^-----BEGIN PGP SIGNATURE-----/{f=0} f' "$SIGN" > signed_text.txt
+          echo "--- signed text (as is) ---"
+          cat -v signed_text.txt
+          echo "--- end of signed text ---"
+
+          # 64-hex tokens on lines mentioning sha256 (case-insensitive)
+          grep -i 'sha256' signed_text.txt | grep -oE '\b[0-9a-fA-F]{64}\b' | tr 'A-F' 'a-f' | sort -u > signed_sha256.txt || true
+          COUNT=$(wc -l < signed_sha256.txt)
+          echo "distinct sha256 values found in signed text: $COUNT"
+          if [ "$COUNT" -ne 1 ]; then
+            echo "FAIL: expected exactly 1 sha256 value in signed text"
+            exit 1
+          fi
+
+          EXPECTED=$(cat signed_sha256.txt)
+          ACTUAL=$(sha256sum "$TARBALL" | cut -d' ' -f1)
+          echo "signed text : $EXPECTED"
+          echo "tarball     : $ACTUAL"
+          if [ "$EXPECTED" = "$ACTUAL" ]; then
+            echo "RESULT: MATCH (internal consistency only, signature NOT verified yet)"
+          else
+            echo "RESULT: MISMATCH"
+            exit 1
+          fi
+
+      - name: Signature key ID (EXPECTED to say no public key)
         continue-on-error: true
         run: |
           cd "$RUNNER_TEMP/br"
-          gpg --version | head -n 1
-          gpg --batch --no-tty --verify "buildroot-${BR_VERSION}.tar.gz.sign" "buildroot-${BR_VERSION}.tar.gz" 2>&1
+          gpg --version > gpg_version.txt
+          sed -n '1p' gpg_version.txt
+          gpg --batch --no-tty --verify "buildroot-${BR_VERSION}.tar.gz.sign" > gpg_verify.txt 2>&1 || true
+          cat gpg_verify.txt
 
-      - name: Signature packets (who signed it, key ID)
+      - name: Signature packets (issuer info)
         continue-on-error: true
         run: |
           cd "$RUNNER_TEMP/br"
-          gpg --batch --no-tty --list-packets "buildroot-${BR_VERSION}.tar.gz.sign" 2>&1 | head -n 40
+          gpg --batch --no-tty --list-packets "buildroot-${BR_VERSION}.tar.gz.sign" > gpg_packets.txt 2>&1 || true
+          sed -n '1,40p' gpg_packets.txt
