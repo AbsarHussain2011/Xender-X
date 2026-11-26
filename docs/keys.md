@@ -13,7 +13,7 @@ Evidence for:
 - Key found on keyserver.ubuntu.com (primary key, uid as above).
 - Buildroot mailing-list announcements: 2025.02.7 and 2025.02.11 were announced by
   Arnout Vandecappelle (arnout at rnout.be), so the identity is plausible.
-- Continuity: this key signed 2025.02.5, 2025.02.17 and 2026.08.2.
+- Continuity: this key signed 2025.02.5, 2025.02.17, 2025.02.20 and 2026.08.2.
 
 Evidence missing / neutral:
 - NO second independent channel confirmed the FINGERPRINT itself.
@@ -22,6 +22,26 @@ Evidence missing / neutral:
 - The fingerprint was learned from the same host (buildroot.org) as the signature.
   Pinning protects against later changes (tarball swapped, or key swapped later),
   not against an attacker who controlled buildroot.org at the time of pinning.
+
+## Verification record (CI run with key file in repo, 12 sec)
+- Key imported from keys/buildroot-2025.02-lts.asc only (no keyserver), exactly 1 primary
+  key, exact fingerprint match.
+- Version 2025.02.20: gpg exit 0, one GOODSIG, one VALIDSIG, primary fingerprint = pinned.
+  Signature made 2026-11-17 18:22:20 UTC.
+- SHA256 in signed text = SHA256 of tarball:
+  44904ee44ac6750e06135454ed5cbcb8ea9354e6d5b7e2b2668581bd8b6ba1b6
+- Expected gpg messages (not errors): "key is not certified" (we pin the fingerprint instead
+  of using web of trust) and "not a detached signature ... NOT verified" (the tarball is
+  checked through the signed SHA256 line, not by gpg).
+- The older 2025.02.14 hash seen in Step 1.1 was NOT checked against the pinned key. Do not
+  use it unless the workflow is run with br_version=2025.02.14 and passes.
+
+## Lead, NOT yet checked
+- The signed text of 2025.02.20 says the public key can be obtained from
+  https://gitlab.com/-/snippets/4836881/raw/main/arnout@rnout.be.asc
+  Different host than buildroot.org, but the URL comes from a message signed by the same key,
+  so it is circular. It could add a second host for the fingerprint, not a fully
+  independent proof. Treat the downloaded content as untrusted data.
 
 ## Older key (NOT trusted by this repo)
 - AB07 D806 D2CE 741F B886  EE50 B025 BA8B 5936 3319 signed releases from 2013 up to
