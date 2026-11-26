@@ -1,0 +1,236 @@
+name: phase1-verify-source
+
+on:
+  push:
+    paths:
+      - '.github/workflows/phase1-verify-source.yml'
+      - 'keys/**'
+  workflow_dispatch:
+    inputs:
+      br_version:
+        description: "Optional 2025.02.x version to verify (empty = newest found in index)"
+        required: false
+        default: ""
+
+env:
+  BR_URL: "https://buildroot.org/downloads"
+  PINNED_FPR: "18C7DF2819C1733D822D599EA500D6EE9CB0E540"
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout (for the pinned key file)
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Discover 2025.02.x tarballs and pick version
+        env:
+          INPUT_VERSION: ${{ inputs.br_version }}
+        run: |
+          set -eu
+          W="$RUNNER_TEMP/w"
+          mkdir -p "$W"
+          cd "$W"
+          curl -fsSL "${BR_URL}/" > index.html
+          grep -oE 'buildroot-2025\.02(\.[0-9]+)?\.tar\.gz' index.html | sort -uV > found.txt || true
+          if [ ! -s found.txt ]; then
+            echo "FAIL: no 2025.02.x tarballs found in downloads index"
+            exit 1
+          fi
+          echo "All 2025.02.x tarballs found in the downloads index (oldest to newest):"
+          cat found.txt
+          NEWEST=$(tail -n 1 found.txt | sed -e 's/^buildroot-//' -e 's/\.tar\.gz$//')
+          echo "NEWEST 2025.02.x found: $NEWEST"
+          if [ -n "${INPUT_VERSION:-}" ]; then
+            if ! printf '%s' "$INPUT_VERSION" | grep -Eq '^2025\.02(\.[0-9]+)?$'; then
+              echo "FAIL: br_version input has an unexpected format"
+              exit 1
+            fi
+            if ! grep -qx "buildroot-${INPUT_VERSION}.tar.gz" found.txt; then
+              echo "FAIL: requested version is not in the downloads index"
+              exit 1
+            fi
+            VERSION="$INPUT_VERSION"
+            echo "Using version from input: $VERSION"
+          else
+            VERSION="$NEWEST"
+            echo "Using newest version: $VERSION"
+          fi
+          if ! printf '%s' "$VERSION" | grep -Eq '^2025\.02(\.[0-9]+)?$'; then
+            echo "FAIL: version string looks wrong"
+            exit 1
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Download tarball and signature, print facts
+        run: |
+          set -eu
+          W="$RUNNER_TEMP/w"
+          mkdir -p "$W/dl"
+          cd "$W/dl"
+          curl -fsSL -o "buildroot-${VERSION}.tar.gz" "${BR_URL}/buildroot-${VERSION}.tar.gz"
+          curl -fsSL -o "buildroot-${VERSION}.tar.gz.sign" "${BR_URL}/buildroot-${VERSION}.tar.gz.sign"
+          ls -l
+          sha256sum "buildroot-${VERSION}.tar.gz"
+          file "buildroot-${VERSION}.tar.gz.sign"
+
+      - name: Key file status
+        run: |
+          if [ -f keys/buildroot-2025.02-lts.asc ]; then
+            echo "MODE: VERIFY (keys/buildroot-2025.02-lts.asc found in repo, keyserver will NOT be used)"
+          else
+            echo "MODE: EXPORT (key file not in repo yet; will fetch from keyserver and upload as artifact)"
+          fi
+
+      - name: EXPORT MODE - fetch key from keyserver and export
+        if: hashFiles('keys/buildroot-2025.02-lts.asc') == ''
+        run: |
+          set -eu
+          W="$RUNNER_TEMP/w"
+          H="$W/home_export"
+          mkdir -p "$H" "$W/out"
+          chmod 700 "$H"
+          GNUPGHOME="$H" timeout 90 gpg --batch --no-tty --keyserver hkps://keyserver.ubuntu.com --recv-keys "$PINNED_FPR"
+          GNUPGHOME="$H" gpg --batch --no-tty --list-keys --with-colons --with-subkey-fingerprints > "$W/export_colons.txt"
+          COUNT=$(grep -c '^pub:' "$W/export_colons.txt" || true)
+          PRIMARIES=$(awk -F: '$1=="pub"{p=1;next} $1=="fpr"&&p==1{print $10;p=0}' "$W/export_colons.txt")
+          echo "primary keys in temporary keyring: $COUNT"
+          echo "primary fingerprint(s): $PRIMARIES"
+          if [ "$COUNT" -ne 1 ] || [ "$PRIMARIES" != "$PINNED_FPR" ]; then
+            echo "FAIL: keyserver did not return exactly the pinned primary key"
+            exit 1
+          fi
+          GNUPGHOME="$H" gpg --batch --no-tty --export --export-options export-minimal --armor "$PINNED_FPR" > "$W/out/buildroot-2025.02-lts.asc"
+          echo "--- exported file inspection ---"
+          GNUPGHOME="$H" gpg --batch --no-tty --show-keys --with-fingerprint "$W/out/buildroot-2025.02-lts.asc"
+          sha256sum "$W/out/buildroot-2025.02-lts.asc"
+          wc -c "$W/out/buildroot-2025.02-lts.asc"
+
+      - name: EXPORT MODE - upload key artifact
+        if: hashFiles('keys/buildroot-2025.02-lts.asc') == ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: buildroot-key
+          path: ${{ runner.temp }}/w/out/buildroot-2025.02-lts.asc
+          if-no-files-found: error
+
+      - name: VERIFY MODE - import pinned key from repo file (exact fingerprint or fail)
+        if: hashFiles('keys/buildroot-2025.02-lts.asc') != ''
+        run: |
+          set -eu
+          W="$RUNNER_TEMP/w"
+          H="$W/home_pinned"
+          mkdir -p "$H"
+          chmod 700 "$H"
+          KEYFILE="$GITHUB_WORKSPACE/keys/buildroot-2025.02-lts.asc"
+          GNUPGHOME="$H" gpg --batch --no-tty --show-keys --with-colons --with-subkey-fingerprints "$KEYFILE" > "$W/keyfile_colons.txt"
+          COUNT=$(grep -c '^pub:' "$W/keyfile_colons.txt" || true)
+          PRIMARIES=$(awk -F: '$1=="pub"{p=1;next} $1=="fpr"&&p==1{print $10;p=0}' "$W/keyfile_colons.txt")
+          STATE=$(awk -F: '$1=="pub"{print $2}' "$W/keyfile_colons.txt")
+          echo "primary keys in key file: $COUNT"
+          echo "primary fingerprint: $PRIMARIES"
+          echo "pub validity flag: '$STATE' (e = expired, r = revoked)"
+          if [ "$COUNT" -ne 1 ]; then
+            echo "FAIL: key file must contain exactly one primary key"
+            exit 1
+          fi
+          if [ "$PRIMARIES" != "$PINNED_FPR" ]; then
+            echo "FAIL: fingerprint in key file does not match pinned fingerprint"
+            exit 1
+          fi
+          case "$STATE" in
+            e|r) echo "FAIL: key is expired or revoked"; exit 1 ;;
+          esac
+          GNUPGHOME="$H" gpg --batch --no-tty --import "$KEYFILE"
+          GNUPGHOME="$H" gpg --batch --no-tty --list-keys --with-fingerprint
+          echo "RESULT: pinned key imported, fingerprint exact match"
+
+      - name: VERIFY MODE - gpg verify clearsigned .sign (hard fail)
+        if: hashFiles('keys/buildroot-2025.02-lts.asc') != ''
+        run: |
+          set -eu
+          W="$RUNNER_TEMP/w"
+          H="$W/home_pinned"
+          cd "$W/dl"
+          SIGN="buildroot-${VERSION}.tar.gz.sign"
+          SM=$(grep -c '^-----BEGIN PGP SIGNED MESSAGE-----' "$SIGN" || true)
+          SG=$(grep -c '^-----BEGIN PGP SIGNATURE-----' "$SIGN" || true)
+          echo "signed-message blocks: $SM, signature blocks: $SG"
+          if [ "$SM" -ne 1 ] || [ "$SG" -ne 1 ]; then
+            echo "FAIL: .sign must contain exactly one signed block"
+            exit 1
+          fi
+          RC=0
+          GNUPGHOME="$H" gpg --batch --no-tty --status-fd 3 --verify "$SIGN" 3> status.txt 2> verify.txt || RC=$?
+          echo "--- gpg human output ---"
+          cat verify.txt
+          echo "--- gpg status lines ---"
+          cat status.txt
+          echo "gpg exit code: $RC"
+          if [ "$RC" -ne 0 ]; then
+            echo "FAIL: gpg --verify returned non-zero"
+            exit 1
+          fi
+          if grep -E '^\[GNUPG:\] (BADSIG|EXPSIG|EXPKEYSIG|REVKEYSIG|ERRSIG|NO_PUBKEY) ' status.txt; then
+            echo "FAIL: bad, expired, revoked or unknown-key signature status found"
+            exit 1
+          fi
+          GS=$(grep -c '^\[GNUPG:\] GOODSIG ' status.txt || true)
+          VS=$(grep -c '^\[GNUPG:\] VALIDSIG ' status.txt || true)
+          if [ "$GS" -ne 1 ] || [ "$VS" -ne 1 ]; then
+            echo "FAIL: expected exactly one GOODSIG and one VALIDSIG (got $GS and $VS)"
+            exit 1
+          fi
+          PRIM=$(awk '$1=="[GNUPG:]" && $2=="VALIDSIG"{print $NF}' status.txt)
+          SIGNER=$(awk '$1=="[GNUPG:]" && $2=="VALIDSIG"{print $3}' status.txt)
+          echo "signing key fingerprint : $SIGNER"
+          echo "primary key fingerprint : $PRIM"
+          if [ "$PRIM" != "$PINNED_FPR" ]; then
+            echo "FAIL: signature is not from the pinned primary key"
+            exit 1
+          fi
+          echo "RESULT: Good signature from pinned fingerprint"
+
+      - name: VERIFY MODE - compare signed SHA256 with tarball (hard fail)
+        if: hashFiles('keys/buildroot-2025.02-lts.asc') != ''
+        run: |
+          set -eu
+          W="$RUNNER_TEMP/w"
+          cd "$W/dl"
+          SIGN="buildroot-${VERSION}.tar.gz.sign"
+          TARBALL="buildroot-${VERSION}.tar.gz"
+          awk '/^-----BEGIN PGP SIGNED MESSAGE-----/{f=1;next} /^-----BEGIN PGP SIGNATURE-----/{f=0} f' "$SIGN" > signed_text.txt
+          echo "--- signed text (as is) ---"
+          cat -v signed_text.txt
+          echo "--- end of signed text ---"
+          grep -i 'sha256' signed_text.txt | grep -oE '\b[0-9a-fA-F]{64}\b' | tr 'A-F' 'a-f' | sort -u > signed_sha256.txt || true
+          COUNT=$(wc -l < signed_sha256.txt)
+          echo "distinct sha256 values in signed text: $COUNT"
+          if [ "$COUNT" -ne 1 ]; then
+            echo "FAIL: expected exactly 1 sha256 value in signed text"
+            exit 1
+          fi
+          EXPECTED=$(cat signed_sha256.txt)
+          ACTUAL=$(sha256sum "$TARBALL" | cut -d' ' -f1)
+          echo "signed text : $EXPECTED"
+          echo "tarball     : $ACTUAL"
+          if [ "$EXPECTED" != "$ACTUAL" ]; then
+            echo "FAIL: tarball sha256 does not match the signed value"
+            exit 1
+          fi
+          {
+            echo "## Buildroot source verification"
+            echo ""
+            echo "- Verified version: ${VERSION}"
+            echo "- Tarball SHA-256 (matches signed text): ${ACTUAL}"
+            echo "- Signer primary fingerprint: ${PINNED_FPR}"
+            echo "- Key trust level: PARTIALLY VERIFIED (see docs/KEYS.md)"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "RESULT: VERIFIED version=${VERSION} sha256=${ACTUAL}"
+          echo "Key trust level: PARTIALLY VERIFIED (see docs/KEYS.md)"
