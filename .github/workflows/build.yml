@@ -1,0 +1,233 @@
+name: build
+
+on:
+  push:
+    paths:
+      - '.github/workflows/build.yml'
+      - 'external/**'
+      - 'scripts/**'
+      - 'keys/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  BR_VERSION: "2025.02.20"
+  BR_SHA256: "44904ee44ac6750e06135454ed5cbcb8ea9354e6d5b7e2b2668581bd8b6ba1b6"
+  PINNED_FPR: "18C7DF2819C1733D822D599EA500D6EE9CB0E540"
+  BR_URL: "https://buildroot.org/downloads"
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Runner facts and host dependencies
+        run: |
+          date -u
+          echo "nproc: $(nproc)"
+          free -h
+          df -h /
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends bc cpio rsync unzip file wget
+          for t in gcc g++ make patch perl python3 tar gzip bzip2 unzip rsync cpio bc wget file; do
+            command -v "$t" > /dev/null || echo "MISSING TOOL: $t"
+          done
+          gcc --version | sed -n '1p'
+
+      - name: Prepare cache directories
+        run: mkdir -p ~/buildroot/dl ~/.buildroot-ccache
+
+      - name: Restore dl cache
+        id: cache_dl
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/buildroot/dl
+          key: br-dl-${{ env.BR_VERSION }}-${{ hashFiles('external/configs/xenderx_defconfig') }}
+          restore-keys: |
+            br-dl-${{ env.BR_VERSION }}-
+            br-dl-
+
+      - name: Restore ccache
+        id: cache_ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.buildroot-ccache
+          key: br-ccache-${{ env.BR_VERSION }}-${{ github.run_id }}
+          restore-keys: |
+            br-ccache-${{ env.BR_VERSION }}-
+
+      - name: Cache restore result
+        run: |
+          echo "dl exact hit     : ${{ steps.cache_dl.outputs.cache-hit }}"
+          echo "dl matched key   : ${{ steps.cache_dl.outputs.cache-matched-key }}"
+          echo "ccache exact hit : ${{ steps.cache_ccache.outputs.cache-hit }}"
+          echo "ccache matched   : ${{ steps.cache_ccache.outputs.cache-matched-key }}"
+          du -sh ~/buildroot/dl ~/.buildroot-ccache || true
+
+      - name: Download Buildroot and verify (hard fail)
+        run: |
+          set -eu
+          D="$RUNNER_TEMP/dlsrc"
+          mkdir -p "$D"
+          curl -fsSL -o "$D/buildroot-${BR_VERSION}.tar.gz" "${BR_URL}/buildroot-${BR_VERSION}.tar.gz"
+          curl -fsSL -o "$D/buildroot-${BR_VERSION}.tar.gz.sign" "${BR_URL}/buildroot-${BR_VERSION}.tar.gz.sign"
+          bash scripts/verify_buildroot.sh "$BR_VERSION" "$BR_SHA256" "$PINNED_FPR" keys/buildroot-2025.02-lts.asc "$D"
+
+      - name: Extract verified Buildroot
+        run: |
+          set -eu
+          tar -xzf "$RUNNER_TEMP/dlsrc/buildroot-${BR_VERSION}.tar.gz" -C "$HOME/buildroot" --strip-components=1
+          test -f "$HOME/buildroot/Makefile"
+          ls "$HOME/buildroot" | sed -n '1,40p'
+
+      - name: Configure (xenderx_defconfig) and check that every option landed
+        run: |
+          set -eu
+          BR_SRC="$HOME/buildroot"
+          BR_OUT="$HOME/xenderx-out"
+          make -C "$BR_SRC" O="$BR_OUT" BR2_EXTERNAL="$GITHUB_WORKSPACE/external" xenderx_defconfig
+          bash scripts/check_defconfig.sh "$BR_OUT/.config" external/configs/xenderx_defconfig
+          echo "--- key facts from .config ---"
+          grep -E '^BR2_(x86_64|TOOLCHAIN_BUILDROOT_GLIBC|INIT_|CCACHE|LINUX_KERNEL|TARGET_ROOTFS|TARGET_GENERIC)' "$BR_OUT/.config" | sed -n '1,80p' || true
+
+      - name: Build
+        id: build
+        run: |
+          set -u
+          BR_OUT="$HOME/xenderx-out"
+          START=$(date +%s)
+          RC=0
+          make -C "$BR_OUT" 2>&1 | tee "$RUNNER_TEMP/build.log" || RC=$?
+          END=$(date +%s)
+          echo "$((END - START))" > "$RUNNER_TEMP/build_seconds.txt"
+          echo "BUILD_SECONDS=$((END - START)) EXIT_CODE=$RC"
+          exit "$RC"
+
+      - name: Post-build checks (kernel fragment landed, release string, images)
+        if: success()
+        run: |
+          set -eu
+          BR_OUT="$HOME/xenderx-out"
+          KCONF=$(find "$BR_OUT/build" -maxdepth 2 -type f -name .config -path '*/linux-[0-9]*/.config' | sed -n '1p')
+          echo "kernel .config: $KCONF"
+          test -n "$KCONF"
+          bash scripts/check_kernel_config.sh "$KCONF" external/board/xenderx/linux/01-version.fragment
+          REL=$(find "$BR_OUT/build" -maxdepth 5 -type f -path '*/linux-[0-9]*/include/config/kernel.release' | sed -n '1p')
+          echo "kernel.release file: $REL"
+          test -n "$REL"
+          echo "kernel release string: $(cat "$REL")"
+          grep -q -- '-xenderx' "$REL"
+          ls -l "$BR_OUT/images"
+          test -s "$BR_OUT/images/bzImage"
+          test -s "$BR_OUT/images/rootfs.cpio.gz"
+
+      - name: ccache stats, cache sizes, repo cache usage
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          BR_OUT="$HOME/xenderx-out"
+          if [ -x "$BR_OUT/host/bin/ccache" ]; then
+            CCACHE_DIR="$HOME/.buildroot-ccache" "$BR_OUT/host/bin/ccache" -s || true
+          else
+            echo "ccache binary not found in $BR_OUT/host/bin"
+          fi
+          echo "--- sizes ---"
+          du -sh "$HOME/buildroot/dl" "$HOME/.buildroot-ccache" || true
+          df -h /
+          echo "--- repo cache usage (GitHub API) ---"
+          gh api "repos/${GITHUB_REPOSITORY}/actions/cache/usage" || echo "could not read cache usage"
+
+      - name: Save dl cache
+        if: always() && steps.cache_dl.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: ~/buildroot/dl
+          key: br-dl-${{ env.BR_VERSION }}-${{ hashFiles('external/configs/xenderx_defconfig') }}
+
+      - name: Save ccache
+        if: always()
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.buildroot-ccache
+          key: br-ccache-${{ env.BR_VERSION }}-${{ github.run_id }}
+
+      - name: Stage artifacts
+        if: always()
+        run: |
+          BR_OUT="$HOME/xenderx-out"
+          S="$RUNNER_TEMP/stage"
+          mkdir -p "$S/images" "$S/kconfig"
+          for f in bzImage rootfs.cpio.gz; do
+            if [ -f "$BR_OUT/images/$f" ]; then cp "$BR_OUT/images/$f" "$S/images/"; fi
+          done
+          KCONF=$(find "$BR_OUT/build" -maxdepth 2 -type f -name .config -path '*/linux-[0-9]*/.config' 2>/dev/null | sed -n '1p')
+          if [ -n "$KCONF" ]; then cp "$KCONF" "$S/kconfig/kernel.config"; fi
+          if [ -f "$BR_OUT/.config" ]; then cp "$BR_OUT/.config" "$S/kconfig/buildroot.config"; fi
+          ls -lR "$S"
+
+      - name: Upload images (bzImage, rootfs.cpio.gz)
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xenderx-images
+          path: ${{ runner.temp }}/stage/images
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload final kernel and Buildroot .config
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xenderx-kernel-config
+          path: ${{ runner.temp }}/stage/kconfig
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Upload build.log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: ${{ runner.temp }}/build.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Show last 80 lines of build.log on failure
+        if: failure()
+        run: |
+          if [ -f "$RUNNER_TEMP/build.log" ]; then
+            tail -n 80 "$RUNNER_TEMP/build.log"
+          else
+            echo "no build.log (failure happened before the build step, see the failing step above)"
+          fi
+
+      - name: Summary
+        if: always()
+        run: |
+          SECS="n/a"
+          if [ -f "$RUNNER_TEMP/build_seconds.txt" ]; then SECS=$(cat "$RUNNER_TEMP/build_seconds.txt"); fi
+          {
+            echo "## Build summary"
+            echo ""
+            echo "- Buildroot: ${BR_VERSION}"
+            echo "- Build step seconds: ${SECS}"
+            echo "- dl cache exact hit: ${{ steps.cache_dl.outputs.cache-hit }}"
+            echo "- ccache restored key: ${{ steps.cache_ccache.outputs.cache-matched-key }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "BUILD_SECONDS=${SECS}"
